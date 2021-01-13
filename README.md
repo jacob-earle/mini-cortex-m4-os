@@ -4,6 +4,7 @@ A mini OS targeting Cortex-m4 platform (STM32F4-Discovery) written in Rust.
 ## Dependencies
 - xPack QEMU fork: https://xpack.github.io/qemu-arm/
 - Nightly rust (cargo) tool chain.
+- `rustup target add thumbv7em-none-eabi`
 
 ## Run
 - `cargo build` to compile the binary image.
