@@ -1,15 +1,20 @@
 #![feature(asm)]
 #![feature(naked_functions)]
+#![feature(default_alloc_error_handler)]
 #![no_main]
 #![no_std]
 
+extern crate alloc;
+
 use panic_halt as _;
 
-use core::cell::RefCell;
+use core::{mem, cell::RefCell};
+use alloc::string::String;
 use lazy_static::lazy_static;
 use cortex_m::{asm, interrupt, peripheral::syst::SystClkSource, Peripherals};
 use cortex_m_rt::{entry, exception};
 use cortex_m_semihosting::{hprint, hprintln};
+use alloc_cortex_m::CortexMHeap;
 
 /// This is a wrapper that provides an immutable reference to its
 /// contained value only when we are within an interrupt-free context.
@@ -17,131 +22,193 @@ use cortex_m_semihosting::{hprint, hprintln};
 /// mutual exclusion, we rename it as exception cell (ExcpCell).
 use cortex_m::interrupt::Mutex as ExcpCell;
 
+#[global_allocator]
+static ALLOCATOR: CortexMHeap = CortexMHeap::empty();
 /**
  *  SRAM Layout:
- *       High Address
- *  +-------------------+  - 0x2002_0000  Pointed by MSP (Main Stack Pointer)
- *  |     Exception     |
- *  |       Stack       |
- *  +-------------------+  - 0x2001_e000  Pointed by PSP (Process Stack Pointer)
- *  |       Init        |
- *  |       Stack       |
- *  +-------------------+  - 0x2001_c000  Pointed by PSP
- *  |    Task Stack 0   |
- *  +-------------------+  - 0x2001_b000  Pointed by PSP
- *  |        ...        |        ...
- *  +-------------------+  - 0x2001_9000  Pointed by PSP
- *  |    Task Stack 3   |
- *  +-------------------+  - 0x2001_8000
- *  |       Free        |
- *  +-------------------+  - 0x2000_0000
+ *           High Address
+ *  +-----------------------------+  - 0x2002_0000  Pointed by MSP (Main Stack Pointer)
+ *  |     Task Kernel Stack 0     |
+ *  +-----------------------------+  - 0x2001_f000  Pointed by MSP
+ *  |     Task Kernel Stack 1     |
+ *  +-----------------------------+  - 0x2001_e000  Pointed by MSP
+ *  |     Task Kernel Stack 2     |
+ *  +-----------------------------+  - 0x2001_d000  Pointed by MSP
+ *  |     Task Kernel Stack 3     |
+ *  +-----------------------------+  - 0x2001_c000  Pointed by PSP (Process Stack Pointer)
+ *  |      Task User Stack 0      |
+ *  +-----------------------------+  - 0x2001_b000  Pointed by PSP
+ *  |      Task User Stack 1      |
+ *  +-----------------------------+  - 0x2001_a000  Pointed by PSP
+ *  |      Task User Stack 2      |
+ *  +-----------------------------+  - 0x2001_9000  Pointed by PSP
+ *  |      Task User Stack 3      |
+ *  +-----------------------------+  - 0x2001_8000
+ *  |            Heap             |
+ *  +-----------------------------+  - Heap Start
+ *  |        DATA + .BSS          |
+ *  +-----------------------------+  - 0x2000_0000
+ *            Low Address
  */
 
 #[repr(usize)]
 enum StackBottom {
-    ExceptionStack = 0x2002_0000,
-    InitStack      = 0x2001_e000,
-    TaskStack0     = 0x2001_c000,
-    TaskStack1     = 0x2001_b000,
-    TaskStack2     = 0x2001_a000,
-    TaskStack3     = 0x2001_9000,
+    TaskKernStack0 = 0x2002_0000,
+    TaskKernStack1 = 0x2001_f000,
+    TaskKernStack2 = 0x2001_e000,
+    TaskKernStack3 = 0x2001_d000,
+    TaskUserStack0 = 0x2001_c000,
+    TaskUserStack1 = 0x2001_b000,
+    TaskUserStack2 = 0x2001_a000,
+    TaskUserStack3 = 0x2001_9000
 }
 
-/// Software saved registers. These registers are saved upon
-/// systick handler entry.
+/// Registers that should be saved upon context switch.
 #[repr(C)]
-struct SWSavedRegs {
-    r4: u32,
-    r5: u32,
+struct KernelContext {
+    lr: usize,   // return address to return from `context_switch()`
+    msp: usize,  // the exception stack pointer of a task
+    r4: u32,     // the registers below are callee-saved
+    r5: u32,     // in extern "C" calling convention
     r6: u32,
     r7: u32,
     r8: u32,
     r9: u32,
     r10: u32,
-    r11: u32,
+    r11: u32
 }
 
-/// Hardware saved registers. These registers are saved automatically
-/// by hardware upon exceptions.
+impl KernelContext {
+    fn new() -> KernelContext {
+        KernelContext {
+            lr: 0,
+            msp: 0,
+            r4: 0,
+            r5: 0,
+            r6: 0,
+            r7: 0,
+            r8: 0,
+            r9: 0,
+            r10: 0,
+            r11: 0
+        }
+    }
+}
+
+/// When a new task starts, it should has an exception stack frame
+/// structured as bellow. Note that this is pointed by MSP.
 #[repr(C)]
-struct HWSavedRegs {
+struct TaskStartKernelStackFrame {
+    id: usize,
+    psp: usize,
+    lr: usize
+}
+
+/// Hardware saved registers upon exception. Note that this is pointed by PSP.
+#[repr(C)]
+struct TrapFrame {
     r0: u32,
     r1: u32,
     r2: u32,
     r3: u32,
     r12: u32,
-    lr: u32,
-    pc: u32,
+    lr: usize,
+    pc: usize,
     psr: u32
-}
-
-/// The full trap frame, combining software and hardware saved registers.
-#[repr(C)]
-struct TrapFrame {
-    sw_saved_regs: SWSavedRegs,
-    hw_saved_regs: HWSavedRegs
 }
 
 /// Possible states of a task. Currently, we have only tasks with
 /// forever loop, so these two states suffice.
 enum TaskState {
     Empty,   // empty task struct
-    Ready    // task struct is loaded with a context and can be switched to
+    Sleep,   // sleeping and should not be scheduled
+    Ready    // task struct is loaded with a context and can be scheduled
 }
 
 /// The structure representing a task.
 struct Task {
-    stack_bottom: usize, // the address of the runtime stack bottom
-    stack_top: usize,    // the address of the current runtime stack top
-    state: TaskState     // the task state
+    id: usize,                  // the id of this task
+    user_stack_bottom: usize,   // the address of the user stack bottom
+    kernel_stack_bottom: usize, // the address of the exception stack bottom
+    state: TaskState,           // the task state
+    kernel_ctxt: KernelContext
 }
 
 impl Task {
-    fn new(stack_bottom: usize) -> Task {
+    fn new(id: usize, user_stack_bottom: usize, kernel_stack_bottom: usize) -> Task {
         Task {
-            stack_top: 0,
-            stack_bottom,
-            state: TaskState::Empty
+            id,
+            user_stack_bottom,
+            kernel_stack_bottom,
+            state: TaskState::Empty,
+            kernel_ctxt: KernelContext::new()
         }
     }
 
     /// Load the task structure with a task to run by providing the entry
     /// function. Here we set up a dummy trap frame, so that if we perform an
-    /// exception return to this task, it will start executing from the
+    /// exception returning to this task, it will start executing from the
     /// entry function.
     fn load(&mut self, start: extern "C" fn()->!) {
-        // Reserve space for a dummy trap frame.
-        self.stack_top = self.stack_bottom - core::mem::size_of::<TrapFrame>();
-
+        // Reserve space for a dummy trap frame in the user stack.
+        let user_stack_top
+            = self.user_stack_bottom - mem::size_of::<TrapFrame>();
         let tf = {
-            let tf_ptr = self.stack_top as *mut TrapFrame;
+            let tf_ptr = user_stack_top as *mut TrapFrame;
             unsafe { &mut *tf_ptr }
         };
 
         // The only bit we need to set in the program state register (PSR)
         // is the Thumb bit (the 24th). Cortex-m4 always run in Thumb state,
-        //  so we always have to set the Thumb bit.
-        tf.hw_saved_regs.psr = 0x01000000;
+        // so we must always set the Thumb bit.
+        tf.psr = 0x01000000;
 
         // This is the actual return address of the exception handler. We set
         // it to the entry function of the new task.
-        tf.hw_saved_regs.pc = start as u32;
+        tf.pc = start as usize;
 
         // All the left registers can have arbitrary value.
-        tf.hw_saved_regs.lr = 0;
-        tf.hw_saved_regs.r12 = 0;
-        tf.hw_saved_regs.r3 = 0;
-        tf.hw_saved_regs.r2 = 0;
-        tf.hw_saved_regs.r1 = 0;
-        tf.hw_saved_regs.r0 = 0;
-        tf.sw_saved_regs.r4 = 0;
-        tf.sw_saved_regs.r5 = 0;
-        tf.sw_saved_regs.r6 = 0;
-        tf.sw_saved_regs.r7 = 0;
-        tf.sw_saved_regs.r8 = 0;
-        tf.sw_saved_regs.r9 = 0;
-        tf.sw_saved_regs.r10 = 0;
-        tf.sw_saved_regs.r11 = 0;
+        tf.lr = 0;
+        tf.r12 = 0;
+        tf.r3 = 0;
+        tf.r2 = 0;
+        tf.r1 = 0;
+        tf.r0 = 0;
+
+        // Reserve space for the start stack frame in the kernel stack.
+        let kern_stack_top =
+            self.kernel_stack_bottom - mem::size_of::<TaskStartKernelStackFrame>();
+        let start_stack_frame = {
+            let start_stack_frame_ptr
+                = kern_stack_top as *mut TaskStartKernelStackFrame;
+            unsafe { &mut *start_stack_frame_ptr }
+        };
+
+        // The field below will be loaded into LR register in `task_start()`.
+        // This special "return address" will trigger an exception return when it
+        // is loaded into PC. Specifically, this value indicates the CPU to perform
+        // 1. Return to thread mode (from exception mode).
+        // 2. Use PSP for return.
+        // 3. FPU was not used. (So do not try to restore FP regs from the stack.)
+        start_stack_frame.lr = 0xffff_fffd;
+
+        // The field below will be loaded into PSP register when the task starts.
+        // By setting PSP, the exception return procedure will use the dummy trap
+        // frame we create above to restore user context, which essentially causes
+        // the CPU to start running the user code entry function.
+        start_stack_frame.psp = user_stack_top;
+
+        // The field below will be passed as the argument to `task_init()`.
+        start_stack_frame.id = self.id;
+
+        // The field below will be loaded into MSP register upon context switch.
+        // This makes sure each task runs with its own kernel stack.
+        self.kernel_ctxt.msp = kern_stack_top;
+
+        // The field below will be loaded into LR register in `context_switch()`.
+        // This causes `context_switch()` to return to `task_start()` to start the
+        // new task.
+        self.kernel_ctxt.lr = task_start as usize;
 
         self.state = TaskState::Ready;
     }
@@ -153,6 +220,16 @@ struct TaskList {
     last_run: Option<usize>  // the index of the last run task
 }
 
+impl TaskList {
+    /// Force the system to think that it is running the task of the given `task_id`
+    /// and `state`. This function is unsafe because if we set the wrong `task_id`,
+    /// we will use a wrong stack later on which breaks memory safety. This function
+    /// is designed to use only during system initialization.
+    unsafe fn override_running_task(&mut self, task_id: usize, state: TaskState) {
+        self.last_run = Some(task_id);
+        self.tasks[task_id].state = state;
+    }
+}
 
 lazy_static! {
     static ref PERIPHERALS: ExcpCell<RefCell<Peripherals>> = {
@@ -162,10 +239,14 @@ lazy_static! {
 
     static ref TASKLIST: ExcpCell<RefCell<TaskList>> = {
         let tasks = [
-            Task::new(StackBottom::TaskStack0 as usize),
-            Task::new(StackBottom::TaskStack1 as usize),
-            Task::new(StackBottom::TaskStack2 as usize),
-            Task::new(StackBottom::TaskStack3 as usize)
+            Task::new(0, StackBottom::TaskUserStack0 as usize,
+                      StackBottom::TaskKernStack0 as usize),
+            Task::new(1, StackBottom::TaskUserStack1 as usize,
+                      StackBottom::TaskKernStack1 as usize),
+            Task::new(2, StackBottom::TaskUserStack2 as usize,
+                      StackBottom::TaskKernStack2 as usize),
+            Task::new(3, StackBottom::TaskUserStack3 as usize,
+                      StackBottom::TaskKernStack3 as usize)
         ];
         ExcpCell::new(RefCell::new(TaskList {
             tasks,
@@ -183,8 +264,8 @@ lazy_static! {
 #[entry]
 fn main() -> ! {
     switch_to_psp_then_init(
-        StackBottom::InitStack as usize, 
-        StackBottom::ExceptionStack as usize
+        StackBottom::TaskUserStack0 as usize, 
+        StackBottom::TaskKernStack0 as usize
     )
 }
 
@@ -204,18 +285,28 @@ extern "C" fn switch_to_psp_then_init(_spin_stack: usize, _exep_stack: usize) ->
     }
 }
 
-/// Initialize our system. This set up the timer and spawn two tasks.
+/// Initialize our system. This function performs the following:
+/// 1. Set up and enable the timer.
+/// 2. Load two tasks of ID 1 and 2.
+/// 3. Treat the current running thread as Task ID 0.
 extern "C" fn init() -> ! {
     // An interrupt free scope.
     interrupt::free(|cs| {
+        let heap_start = cortex_m_rt::heap_start() as usize;
+        let heap_end = 0x2001_8000;
+        let heap_size = heap_end - heap_start;
+        unsafe { ALLOCATOR.init(heap_start, heap_size); }
+
+        hprintln!("heap initialized at 0x{:x?}-0x{:x?}", heap_start, heap_end).unwrap();
+
         {
             let mut p = PERIPHERALS.borrow(cs).borrow_mut();
             let syst = &mut p.SYST;
 
-            // Configures the system timer to trigger a SysTick exception every second.
-            // It has a default CPU clock of 16 MHz so we set the counter to 16_000_000.
+            // Configures the system timer to trigger a SysTick exception every 10ms.
+            // It has a default CPU clock of 16 MHz so we set the counter to 160_000.
             syst.set_clock_source(SystClkSource::Core);
-            syst.set_reload(16_000_000);
+            syst.set_reload(160_000);
             syst.clear_current();
             syst.enable_counter();
             syst.enable_interrupt();
@@ -224,73 +315,156 @@ extern "C" fn init() -> ! {
         {
             // Spawn two tasks. These tasks will be scheduled upon SysTick exception.
             let mut tasklist = TASKLIST.borrow(cs).borrow_mut();
-            tasklist.tasks[0].load(loop_hello);
-            tasklist.tasks[1].load(loop_world);
+            tasklist.tasks[1].load(loop_hello);
+            tasklist.tasks[2].load(loop_world);
+
+            unsafe { tasklist.override_running_task(0, TaskState::Sleep); }
         }
     });
 
-    // We will never return here after the spawned tasks are scheduled.
+    // We will never return here after the spawned tasks (ID 1 and 2) are scheduled.
     loop {
         asm::wfi();
     }
 }
 
+/// Round robin schedule function. Prohibiting this function from being inlined
+/// is an optimization. See `SysTick()` for details.
+#[inline(never)]
+extern "C" fn schedule() {
+    let mut cur_task = 0;
+    let cur_task_ref = &mut cur_task;
 
-// Set the export name so that the linker can find this function and
-// put it to the correct entry in the exception vector table.
-#[export_name = "SysTick"]
+    let switch = 
+        interrupt::free(move |cs| {
+            let mut tasklist = TASKLIST.borrow(cs).borrow_mut();
+
+            // The system should already be initialized if we are here. We are
+            // sure that it is not None.
+            let cur_task = tasklist.last_run.unwrap();
+            *cur_task_ref = cur_task;
+
+            // The next task in round-robin order.
+            let rr_next = cur_task + 1;
+
+            // Pick the next task to run in a round robin fashion.
+            let mut next_task = cur_task;
+            for (i, task) in tasklist.tasks.iter().enumerate().skip(rr_next) {
+                if let TaskState::Ready = task.state {
+                    next_task = i;
+                    break;
+                }
+            }
+            if cur_task == next_task {
+                for (i, task) in tasklist.tasks[0..rr_next].iter().enumerate() {
+                    if let TaskState::Ready = task.state {
+                        next_task = i;
+                        break;
+                    }
+                }
+            }
+
+            // Return Some(from_ptr, to_ptr) if there is a task to be switched to.
+            if cur_task < next_task {
+                let (first_half, second_half) = tasklist.tasks.split_at_mut(next_task);
+                return Some((&mut first_half[cur_task].kernel_ctxt as *mut KernelContext,
+                             &second_half[0].kernel_ctxt as *const KernelContext));
+            } else if cur_task > next_task {
+                let (first_half, second_half) = tasklist.tasks.split_at_mut(cur_task);
+                return Some((&mut second_half[0].kernel_ctxt as *mut KernelContext,
+                             &first_half[next_task].kernel_ctxt as *const KernelContext));
+            }
+
+            // If we have no task other than the current running task to schedule,
+            // return None.
+            return None;
+        });
+
+    // Save the user stack pointer in the kernel stack.
+    let psp = get_psp();
+
+    // Perform context switch if there is another task to be scheduled.
+    if let Some((from_ptr, to_ptr)) = switch {
+        unsafe { context_switch(from_ptr, to_ptr); }
+    }
+
+    // Restore the user stack pointer from the kernel stack.
+    set_psp(psp);
+
+    interrupt::free(|cs| {
+        let mut tasklist = TASKLIST.borrow(cs).borrow_mut();
+        tasklist.last_run = Some(cur_task);
+    });
+}
+
+/// Switch kernel context. This function is unsafe because the caller of this
+/// function must make sure that the two pointer arguments are valid.
 #[naked]
-pub unsafe extern "C" fn syst_entry() -> ! {
+unsafe extern "C" fn context_switch(_src_ctxt: *mut KernelContext,
+                                    _dst_ctxt: *const KernelContext) {
     asm!(
-        "push  {{lr}}",          // save LR to the *exception* stack
-        "mrs   r0, psp",         // --+ 
-        "stmdb r0!, {{r4-r11}}", //   | push r4-r11 to the *task* stack
-        "msr   psp, r0",         // --+
-        "bl    {schedule}",      // run the schedule function
-        "mrs   r0, psp",         // --+ 
-        "ldmia r0!, {{r4-r11}}", //   | pop r4-r11 from the *new task* stack
-        "msr   psp, r0",         // --+
-        "pop   {{pc}}",          // perform exception return
-        schedule = sym schedule,
+        "str   lr, [r0], #4",   // save LR of the src context
+        "str   sp, [r0], #4",   // save MSP of the src context
+        "stmia r0, {{r4-r11}}", // save R4-R11 of the src context
+        "ldr   lr, [r1], #4",   // restore LR of the dst context
+        "ldr   sp, [r1], #4",   // restore MSP of the dst context
+        "ldmia r1, {{r4-r11}}", // restore R4-R11 of the dst context
+        "bx    lr",             // resume executing in the dst context
+        options(noreturn)       // supress compiler generated return instruction
+    )
+}
+
+/// The entry function to start a task. This function should be run in kernel
+/// mode. This function is unsafe because the caller must set up the correct
+/// stack frame before jumping to this function. The required layout of the
+/// stack frame is defined in `TaskStartKernelStackFrame`. The stack frame is
+/// prepared in `Task::load()`.
+/// Required stack frame:
+///            High Address
+///     +-----------------------+
+///     |          ...          |
+///     +-----------------------+
+///     | Exception Return Addr |
+///     +-----------------------+
+///     |     New PSP Value     |
+///     +-----------------------+
+///     |      New Task ID      |
+///     +-----------------------+  <-- MSP
+///            Low Address
+#[naked]
+unsafe extern "C" fn task_start() -> ! {
+    asm!(
+        "pop   {{r0}}",      // perpare arguments for `task_init()`
+        "bl    {task_init}", // run `task_init()`
+        "pop   {{r0}}",      // fetch new PSP value
+        "msr   psp, r0",     // set new PSP value
+        "pop   {{pc}}",      // perform exception return
+        task_init = sym task_init,
         options(noreturn)
     )
 }
 
-/// Round robin schedule function.
-extern "C" fn schedule() {
+/// Perform task initialization. Currently it only sets the current running
+/// task ID in the task list.
+extern "C" fn task_init(task_id: usize) {
     interrupt::free(|cs| {
         let mut tasklist = TASKLIST.borrow(cs).borrow_mut();
-        let mut rr_start = 0;
-
-        // Update the stack top stored in the task structure.
-        if let Some(suspended_task_id) = tasklist.last_run {
-            tasklist.tasks[suspended_task_id].stack_top = get_psp();
-            rr_start = suspended_task_id + 1;
-        }
-
-        // Pick the next task to run in a round robin fashion.
-        for (i, task) in tasklist.tasks.iter().enumerate().skip(rr_start) {
-            if let TaskState::Ready = task.state {
-                set_psp(task.stack_top);
-                tasklist.last_run = Some(i);
-                return;
-            }
-        }
-        for (i, task) in tasklist.tasks[0..rr_start].iter().enumerate() {
-            if let TaskState::Ready = task.state {
-                set_psp(task.stack_top);
-                tasklist.last_run = Some(i);
-                return;
-            }
-        }
+        tasklist.last_run = Some(task_id);
     });
 }
 
 // Endlessly print "hello ".
 extern "C" fn loop_hello() -> ! {
-    loop { 
-        hprint!("hello ").unwrap();
-        asm::wfi(); // halt the CPU until interrupt to save power
+    let s = String::from("hello,\n");
+    loop {
+        hprint!(&s).unwrap();
+
+        // Wait for 1s (task CPU time) after every print.
+        // The SysTick exception occurs every 10ms, so the loop below
+        // for 100 times.
+        for _ in 0..100 {
+            asm::wfi(); // halt the CPU until interrupt
+        }
     }
 }
 
@@ -299,9 +473,15 @@ extern "C" fn loop_hello() -> ! {
 // context switch.
 extern "C" fn loop_world() -> ! {
     let c = '!';
-    loop { 
+    loop {
         hprintln!("world{}", c).unwrap();
-        asm::wfi(); // halt the CPU until interrupt to save power
+
+        // Wait for 1s (task CPU time) after every print.
+        // The SysTick exception occurs every 10ms, so the loop below
+        // for 100 times.
+        for _ in 0..100 {
+            asm::wfi(); // halt the CPU until interrupt
+        }
     }
 }
 
@@ -321,14 +501,34 @@ fn get_psp() -> usize {
     psp
 }
 
+/// SysTick exception is generated every 10ms. We perform a context switch
+/// every 100ms. We prohibit `schedule()` from being inlined, so that the
+/// body of this function is small enough that using only R0-R3 as scratch
+/// registers suffice. Hardware already saves R0-R3 for us upon interrupt
+/// (see TrapFrame for details). We save other registers lazily only if
+/// we need to perform a context switch (through `schedule()`).
 #[exception]
-fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
+unsafe fn SysTick() {
+    static mut CNT: u32 = 0;
+
+    // This is incremented every 10ms.
+    *CNT += 1;
+
+    // Every 100ms we perform a context switch.
+    if *CNT == 10 {
+        *CNT = 0;
+        schedule();
+    }
+}
+
+#[exception]
+unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
     hprintln!("HardFault occured, exception frame:").unwrap();
     hprintln!("{:?}", ef).unwrap();
     loop {}
 }
 
 #[exception]
-fn DefaultHandler(ex_num: i16) {
+unsafe fn DefaultHandler(ex_num: i16) {
     hprintln!("Exception {} occured!", ex_num).unwrap();
 }

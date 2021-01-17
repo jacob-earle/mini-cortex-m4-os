@@ -5,10 +5,14 @@ authors = ["Acciente717 <221thunder@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-cortex-m = "0.7.0"
 cortex-m-rt = "0.6.13"
 cortex-m-semihosting = "0.3.7"
 panic-halt = "0.2.0"
+alloc-cortex-m = "0.4.1"
+
+[dependencies.cortex-m]
+features = ["inline-asm"]
+version = "0.6.4"
 
 [dependencies.lazy_static]
 features = ["spin_no_std"]
