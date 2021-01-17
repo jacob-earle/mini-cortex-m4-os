@@ -26,3 +26,6 @@ target = "thumbv7em-none-eabi"
 
 [target.thumbv7em-none-eabi]
 runner = "qemu-system-gnuarmeclipse --board STM32F4-Discovery -nographic -semihosting-config enable=on,target=native -kernel"
+
+# Use the runner below when debugging.
+# runner = "qemu-system-gnuarmeclipse --board STM32F4-Discovery -nographic -semihosting-config enable=on,target=native -S -gdb tcp::3333 -kernel"

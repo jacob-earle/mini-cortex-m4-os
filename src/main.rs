@@ -1,15 +1,20 @@
 #![feature(asm)]
 #![feature(naked_functions)]
+#![feature(default_alloc_error_handler)]
 #![no_main]
 #![no_std]
+
+extern crate alloc;
 
 use panic_halt as _;
 
 use core::{mem, cell::RefCell};
+use alloc::string::String;
 use lazy_static::lazy_static;
 use cortex_m::{asm, interrupt, peripheral::syst::SystClkSource, Peripherals};
 use cortex_m_rt::{entry, exception};
 use cortex_m_semihosting::{hprint, hprintln};
+use alloc_cortex_m::CortexMHeap;
 
 /// This is a wrapper that provides an immutable reference to its
 /// contained value only when we are within an interrupt-free context.
@@ -17,6 +22,8 @@ use cortex_m_semihosting::{hprint, hprintln};
 /// mutual exclusion, we rename it as exception cell (ExcpCell).
 use cortex_m::interrupt::Mutex as ExcpCell;
 
+#[global_allocator]
+static ALLOCATOR: CortexMHeap = CortexMHeap::empty();
 /**
  *  SRAM Layout:
  *           High Address
@@ -37,7 +44,9 @@ use cortex_m::interrupt::Mutex as ExcpCell;
  *  +-----------------------------+  - 0x2001_9000  Pointed by PSP
  *  |      Task User Stack 3      |
  *  +-----------------------------+  - 0x2001_8000
- *  |            Free             |
+ *  |            Heap             |
+ *  +-----------------------------+  - Heap Start
+ *  |        DATA + .BSS          |
  *  +-----------------------------+  - 0x2000_0000
  *            Low Address
  */
@@ -57,10 +66,10 @@ enum StackBottom {
 /// Registers that should be saved upon context switch.
 #[repr(C)]
 struct KernelContext {
-    lr: u32,   // return address to return from `context_switch()`
-    msp: u32,  // the exception stack pointer of a task
-    r4: u32,   // the registers below are callee-saved
-    r5: u32,   // in extern "C" calling convention
+    lr: usize,   // return address to return from `context_switch()`
+    msp: usize,  // the exception stack pointer of a task
+    r4: u32,     // the registers below are callee-saved
+    r5: u32,     // in extern "C" calling convention
     r6: u32,
     r7: u32,
     r8: u32,
@@ -90,9 +99,9 @@ impl KernelContext {
 /// structured as bellow. Note that this is pointed by MSP.
 #[repr(C)]
 struct TaskStartKernelStackFrame {
-    id: u32,
-    psp: u32,
-    lr: u32
+    id: usize,
+    psp: usize,
+    lr: usize
 }
 
 /// Hardware saved registers upon exception. Note that this is pointed by PSP.
@@ -103,8 +112,8 @@ struct TrapFrame {
     r2: u32,
     r3: u32,
     r12: u32,
-    lr: u32,
-    pc: u32,
+    lr: usize,
+    pc: usize,
     psr: u32
 }
 
@@ -156,7 +165,7 @@ impl Task {
 
         // This is the actual return address of the exception handler. We set
         // it to the entry function of the new task.
-        tf.pc = start as u32;
+        tf.pc = start as usize;
 
         // All the left registers can have arbitrary value.
         tf.lr = 0;
@@ -187,19 +196,19 @@ impl Task {
         // By setting PSP, the exception return procedure will use the dummy trap
         // frame we create above to restore user context, which essentially causes
         // the CPU to start running the user code entry function.
-        start_stack_frame.psp = user_stack_top as u32;
+        start_stack_frame.psp = user_stack_top;
 
         // The field below will be passed as the argument to `task_init()`.
-        start_stack_frame.id = self.id as u32;
+        start_stack_frame.id = self.id;
 
         // The field below will be loaded into MSP register upon context switch.
         // This makes sure each task runs with its own kernel stack.
-        self.kernel_ctxt.msp = kern_stack_top as u32;
+        self.kernel_ctxt.msp = kern_stack_top;
 
         // The field below will be loaded into LR register in `context_switch()`.
         // This causes `context_switch()` to return to `task_start()` to start the
         // new task.
-        self.kernel_ctxt.lr = task_start as u32;
+        self.kernel_ctxt.lr = task_start as usize;
 
         self.state = TaskState::Ready;
     }
@@ -230,10 +239,14 @@ lazy_static! {
 
     static ref TASKLIST: ExcpCell<RefCell<TaskList>> = {
         let tasks = [
-            Task::new(0, StackBottom::TaskUserStack0 as usize, StackBottom::TaskKernStack0 as usize),
-            Task::new(1, StackBottom::TaskUserStack1 as usize, StackBottom::TaskKernStack1 as usize),
-            Task::new(2, StackBottom::TaskUserStack2 as usize, StackBottom::TaskKernStack2 as usize),
-            Task::new(3, StackBottom::TaskUserStack3 as usize, StackBottom::TaskKernStack3 as usize)
+            Task::new(0, StackBottom::TaskUserStack0 as usize,
+                      StackBottom::TaskKernStack0 as usize),
+            Task::new(1, StackBottom::TaskUserStack1 as usize,
+                      StackBottom::TaskKernStack1 as usize),
+            Task::new(2, StackBottom::TaskUserStack2 as usize,
+                      StackBottom::TaskKernStack2 as usize),
+            Task::new(3, StackBottom::TaskUserStack3 as usize,
+                      StackBottom::TaskKernStack3 as usize)
         ];
         ExcpCell::new(RefCell::new(TaskList {
             tasks,
@@ -279,6 +292,13 @@ extern "C" fn switch_to_psp_then_init(_spin_stack: usize, _exep_stack: usize) ->
 extern "C" fn init() -> ! {
     // An interrupt free scope.
     interrupt::free(|cs| {
+        let heap_start = cortex_m_rt::heap_start() as usize;
+        let heap_end = 0x2001_8000;
+        let heap_size = heap_end - heap_start;
+        unsafe { ALLOCATOR.init(heap_start, heap_size); }
+
+        hprintln!("heap initialized at 0x{:x?}-0x{:x?}", heap_start, heap_end).unwrap();
+
         {
             let mut p = PERIPHERALS.borrow(cs).borrow_mut();
             let syst = &mut p.SYST;
@@ -435,8 +455,9 @@ extern "C" fn task_init(task_id: usize) {
 
 // Endlessly print "hello ".
 extern "C" fn loop_hello() -> ! {
+    let s = String::from("hello,\n");
     loop {
-        hprint!("hello,\n").unwrap();
+        hprint!(&s).unwrap();
 
         // Wait for 1s (task CPU time) after every print.
         // The SysTick exception occurs every 10ms, so the loop below
