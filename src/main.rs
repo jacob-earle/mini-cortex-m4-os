@@ -333,16 +333,14 @@ extern "C" fn init() -> ! {
 #[inline(never)]
 extern "C" fn schedule() {
     let mut cur_task = 0;
-    let cur_task_ref = &mut cur_task;
 
     let switch = 
-        interrupt::free(move |cs| {
+        interrupt::free(|cs| {
             let mut tasklist = TASKLIST.borrow(cs).borrow_mut();
 
             // The system should already be initialized if we are here. We are
             // sure that it is not None.
-            let cur_task = tasklist.last_run.unwrap();
-            *cur_task_ref = cur_task;
+            cur_task = tasklist.last_run.unwrap();
 
             // The next task in round-robin order.
             let rr_next = cur_task + 1;
