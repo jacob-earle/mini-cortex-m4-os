@@ -315,8 +315,10 @@ extern "C" fn init() -> ! {
         {
             // Spawn two tasks. These tasks will be scheduled upon SysTick exception.
             let mut tasklist = TASKLIST.borrow(cs).borrow_mut();
-            tasklist.tasks[1].load(loop_hello);
-            tasklist.tasks[2].load(loop_world);
+            //tasklist.tasks[1].load(loop_hello);
+            //tasklist.tasks[2].load(loop_world);
+            tasklist.tasks[1].load(fibonacci_print_array);
+            tasklist.tasks[2].load(fibonacci_print_last_two);
 
             unsafe { tasklist.override_running_task(0, TaskState::Sleep); }
         }
@@ -479,6 +481,48 @@ extern "C" fn loop_world() -> ! {
         // for 100 times.
         for _ in 0..100 {
             asm::wfi(); // halt the CPU until interrupt
+        }
+    }
+}
+
+// Program to print the Fibonnaci numbers successively
+// Written to get an understanding of the task structure
+extern "C" fn fibonacci_print_array() -> !{
+    let mut fibonnacci_numbers = alloc::vec::Vec::new();
+    let mut counter = 2; 
+    fibonnacci_numbers.push(1 as u128);
+    fibonnacci_numbers.push(1 as u128);
+
+    // Successively loop and print Fibonnacci numbers until we run out of memory
+    loop{
+        fibonnacci_numbers.push(fibonnacci_numbers[counter - 1] + fibonnacci_numbers[counter - 2]);
+        hprintln!("Next Number: {} ({})", fibonnacci_numbers[counter], counter).unwrap();
+        counter += 1;
+
+        // Wait for 1s after print
+        for _ in 0..100 {
+            asm::wfi();
+        }
+    }
+}
+
+extern "C" fn fibonacci_print_last_two() -> !{
+    let mut counter = 2; 
+    let mut second_last = 1 as u128;
+    let mut last = 1 as u128;
+    let mut current;
+
+    // Successively loop and print Fibonnacci numbers until we run out of memory
+    loop{
+        current = last + second_last;
+        hprintln!("Next Number: {} ({})", current, counter).unwrap();
+        counter += 1;
+        second_last = last;
+        last = current;
+
+        // Wait for 1s after print
+        for _ in 0..100 {
+            asm::wfi();
         }
     }
 }
