@@ -285,6 +285,9 @@ extern "C" fn switch_to_psp_then_init(_user_stack: usize, _exep_stack: usize) ->
     }
 }
 
+static mut SHOULD_BE_0: u32 = 0;
+static mut SHOULD_BE_42: u32 = 42;
+
 /// Initialize our system. This function performs the following:
 /// 1. Set up and enable the timer.
 /// 2. Load two tasks of ID 1 and 2.
@@ -298,6 +301,18 @@ extern "C" fn init() -> ! {
         unsafe { ALLOCATOR.init(heap_start, heap_size); }
 
         hprintln!("heap initialized at 0x{:x?}-0x{:x?}", heap_start, heap_end).unwrap();
+
+        hprintln!("checking static variables...").unwrap();
+        unsafe {
+            hprintln!("SHOULD_BE_0 has value {}", SHOULD_BE_0).unwrap();
+            hprintln!("SHOULD_BE_42 has value {}", SHOULD_BE_42).unwrap();
+            SHOULD_BE_0 += 0xdead_beaf;
+            hprintln!("SHOULD_BE_0 incremented by 0xdeadbeaf becomes 0x{:x}",
+                      SHOULD_BE_0).unwrap();
+            SHOULD_BE_42 -= 42;
+            hprintln!("SHOULD_BE_42 decremented by 42 becomes {}",
+                      SHOULD_BE_42).unwrap();
+        }
 
         {
             let mut p = PERIPHERALS.borrow(cs).borrow_mut();
