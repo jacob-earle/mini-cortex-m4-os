@@ -12,7 +12,6 @@ use core::{mem, cell::RefCell};
 use alloc::string::String;
 use lazy_static::lazy_static;
 use cortex_m::{asm, interrupt, peripheral::syst::SystClkSource, Peripherals};
-use cortex_m_rt::{entry, exception};
 use cortex_m_semihosting::{hprint, hprintln};
 use alloc_cortex_m::CortexMHeap;
 
@@ -21,6 +20,8 @@ use alloc_cortex_m::CortexMHeap;
 /// Its original name is confusing since it does not really provide any
 /// mutual exclusion, we rename it as exception cell (ExcpCell).
 use cortex_m::interrupt::Mutex as ExcpCell;
+
+mod boot;
 
 #[global_allocator]
 static ALLOCATOR: CortexMHeap = CortexMHeap::empty();
@@ -68,14 +69,14 @@ enum StackBottom {
 struct KernelContext {
     lr: usize,   // return address to return from `context_switch()`
     msp: usize,  // the exception stack pointer of a task
-    r4: u32,     // the registers below are callee-saved
-    r5: u32,     // in extern "C" calling convention
-    r6: u32,
-    r7: u32,
-    r8: u32,
-    r9: u32,
-    r10: u32,
-    r11: u32
+    r4: usize,     // the registers below are callee-saved
+    r5: usize,     // in extern "C" calling convention
+    r6: usize,
+    r7: usize,
+    r8: usize,
+    r9: usize,
+    r10: usize,
+    r11: usize
 }
 
 impl KernelContext {
@@ -88,7 +89,7 @@ impl KernelContext {
             r6: 0,
             r7: 0,
             r8: 0,
-            r9: 0,
+            r9: get_r9(),
             r10: 0,
             r11: 0
         }
@@ -261,8 +262,7 @@ lazy_static! {
 /// context in the same stack, we first switch to process stack
 /// pointer (PSP). As such, normal and exception context will be
 /// saved in two different stacks pointed by PSP and MSP, respectively.
-#[entry]
-fn main() -> ! {
+extern "C" fn main() -> ! {
     switch_to_psp_then_init(
         StackBottom::TaskUserStack0 as usize, 
         StackBottom::TaskKernStack0 as usize
@@ -270,7 +270,7 @@ fn main() -> ! {
 }
 
 #[naked]
-extern "C" fn switch_to_psp_then_init(_spin_stack: usize, _exep_stack: usize) -> ! {
+extern "C" fn switch_to_psp_then_init(_user_stack: usize, _exep_stack: usize) -> ! {
     unsafe {
         asm!(
             "msr  psp, r0",       // update PSP value
@@ -292,7 +292,7 @@ extern "C" fn switch_to_psp_then_init(_spin_stack: usize, _exep_stack: usize) ->
 extern "C" fn init() -> ! {
     // An interrupt free scope.
     interrupt::free(|cs| {
-        let heap_start = cortex_m_rt::heap_start() as usize;
+        let heap_start = boot::heap_start() as usize;
         let heap_end = 0x2001_8000;
         let heap_size = heap_end - heap_start;
         unsafe { ALLOCATOR.init(heap_start, heap_size); }
@@ -499,34 +499,43 @@ fn get_psp() -> usize {
     psp
 }
 
+fn get_r9() -> usize {
+    let r9: usize;
+    unsafe { asm!(
+        "mov {}, r9",
+        out(reg) r9
+    )}
+    r9
+}
+
 /// SysTick exception is generated every 10ms. We perform a context switch
 /// every 100ms. We prohibit `schedule()` from being inlined, so that the
 /// body of this function is small enough that using only R0-R3 as scratch
 /// registers suffice. Hardware already saves R0-R3 for us upon interrupt
 /// (see TrapFrame for details). We save other registers lazily only if
 /// we need to perform a context switch (through `schedule()`).
-#[exception]
-unsafe fn SysTick() {
+#[export_name = "SysTick"]
+pub unsafe extern "C" fn systick_handler() {
     static mut CNT: u32 = 0;
 
     // This is incremented every 10ms.
-    *CNT += 1;
+    CNT += 1;
 
     // Every 100ms we perform a context switch.
-    if *CNT == 10 {
-        *CNT = 0;
+    if CNT == 10 {
+        CNT = 0;
         schedule();
     }
 }
 
-#[exception]
-unsafe fn HardFault(ef: &cortex_m_rt::ExceptionFrame) -> ! {
+#[export_name = "HardFault"]
+pub unsafe extern "C" fn hardfault_handler(ef: &boot::ExceptionFrame) -> ! {
     hprintln!("HardFault occured, exception frame:").unwrap();
     hprintln!("{:?}", ef).unwrap();
     loop {}
 }
 
-#[exception]
-unsafe fn DefaultHandler(ex_num: i16) {
+#[export_name = "DefaultHandler"]
+pub unsafe extern "C" fn default_handler(ex_num: i16) {
     hprintln!("Exception {} occured!", ex_num).unwrap();
 }
