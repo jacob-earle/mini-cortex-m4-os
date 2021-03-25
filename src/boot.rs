@@ -2,7 +2,8 @@
 //! function modified.
 
 use core::{ptr, mem, fmt};
-use super::main;
+
+use super::{main, hardfault_handler};
 
 #[link_section = ".vector_table.reset_vector"]
 #[no_mangle]
@@ -200,8 +201,6 @@ pub static __EXCEPTIONS: [Vector; 14] = [
 ];
 
 extern "C" {
-    fn HardFault();
-
     fn NonMaskableInt();
 
     #[cfg(not(armv6m))]
@@ -239,7 +238,20 @@ pub static __INTERRUPTS: [unsafe extern "C" fn(); 240] = [{
 #[allow(non_snake_case)]
 #[export_name = "HardFaultTrampoline"]
 pub extern "C" fn HardFaultTrampoline() {
-    unsafe { HardFault(); }
+    unsafe {
+        asm!(
+            "mov r0, lr",
+            "mov r1, #4",
+            "tst r0, r1",
+            "bne 0f",
+            "mrs r0, MSP",
+            "b {hardfault_handler}",
+            "0:",
+            "mrs r0, PSP",
+            "b {hardfault_handler}",
+            hardfault_handler = sym hardfault_handler
+        )
+    }
 }
 
 #[allow(non_snake_case)]
