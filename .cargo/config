@@ -19,7 +19,7 @@ rustflags = [
   # "-C", "link-arg=-Wl,-Tlink.x",
   # "-C", "link-arg=-nostartfiles",
 
-  "-C", "relocation-model=rwpi"
+  "-C", "relocation-model=ropi-rwpi"
 ]
 
 [build]
