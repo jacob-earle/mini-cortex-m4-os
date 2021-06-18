@@ -23,6 +23,7 @@ use stm32f4::stm32f407;
 use cortex_m::interrupt::Mutex as ExcpCell;
 
 mod boot;
+mod uart;
 
 #[global_allocator]
 static ALLOCATOR: CortexMHeap = CortexMHeap::empty();
@@ -331,12 +332,15 @@ extern "C" fn init() -> ! {
         {
             // Spawn two tasks. These tasks will be scheduled upon SysTick exception.
             let mut tasklist = TASKLIST.borrow(cs).borrow_mut();
-            tasklist.tasks[1].load(loop_hello);
-            tasklist.tasks[2].load(loop_world);
+            tasklist.tasks[1].load(loop_hello_uart);
+            tasklist.tasks[2].load(loop_world_uart);
 
             unsafe { tasklist.override_running_task(0, TaskState::Sleep); }
         }
     });
+
+    // initialize uart so we can use it
+    uart::uart_init();
 
     // We will never return here after the spawned tasks (ID 1 and 2) are scheduled.
     loop {
@@ -468,11 +472,10 @@ extern "C" fn task_init(task_id: usize) {
 }
 
 // Endlessly print "hello ".
-extern "C" fn loop_hello() -> ! {
+extern "C" fn loop_hello_uart() -> ! {
     let s = String::from("hello,\n");
     loop {
-        hprint!(&s).unwrap();
-
+        uart::uart_print_str(&s);
         // Wait for 1s (task CPU time) after every print.
         // The SysTick exception occurs every 10ms, so the loop below
         // for 100 times.
@@ -485,11 +488,10 @@ extern "C" fn loop_hello() -> ! {
 // Endlessly print "world!". We intentionally make it less symmetric
 // to `loop_hello()` so that it may potentially reveal more bugs in
 // context switch.
-extern "C" fn loop_world() -> ! {
-    let c = '!';
+extern "C" fn loop_world_uart() -> ! {
+    let s = String::from("world!\n");
     loop {
-        hprintln!("world{}", c).unwrap();
-
+        uart::uart_print_str(&s);
         // Wait for 1s (task CPU time) after every print.
         // The SysTick exception occurs every 10ms, so the loop below
         // for 100 times.
