@@ -14,6 +14,7 @@ use lazy_static::lazy_static;
 use cortex_m::{asm, interrupt, peripheral::syst::SystClkSource, Peripherals};
 use cortex_m_semihosting::{hprint, hprintln};
 use alloc_cortex_m::CortexMHeap;
+use stm32f4::stm32f407;
 
 /// This is a wrapper that provides an immutable reference to its
 /// contained value only when we are within an interrupt-free context.

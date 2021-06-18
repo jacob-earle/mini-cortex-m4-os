@@ -16,3 +16,7 @@ version = "0.6.4"
 [dependencies.lazy_static]
 features = ["spin_no_std"]
 version = "1.4.0"
+
+
+[dependencies.stm32f4]
+features = ["stm32f407"]
